@@ -851,19 +851,50 @@ def api_bulk_alive_zip(only: str = Query("VALID,PARTIAL")):
                 exp = int(raw_exp) if str(raw_exp).replace(".", "").isdigit() else 0
                 lines.append("\t".join([dom, inc, c.get("path", "/"), sec, str(exp), c.get("name", ""), c.get("value", "")]))
             z.writestr(stem + ".txt", "\n".join(lines) + "\n")
-            # JSON (Playwright format siap pakai)
-            z.writestr(stem + ".json", json.dumps({
+            # --- JSON array polos: LANGSUNG import ke Cookie-Editor / EditThisCookie ---
+            def _ce(c):
+                exp = c.get("expiry_epoch") or c.get("expirationDate") or c.get("expires")
+                try:
+                    exp = float(exp)
+                except Exception:
+                    exp = float(sess_exp or 0)
+                if exp > 1e12:      # kalau ms → detik
+                    exp = exp / 1000.0
+                return {
+                    "domain": c.get("domain", ".chatgpt.com"),
+                    "expirationDate": exp,
+                    "hostOnly": not str(c.get("domain", "")).startswith("."),
+                    "httpOnly": bool(c.get("httpOnly")),
+                    "name": c.get("name", ""),
+                    "path": c.get("path", "/"),
+                    "sameSite": (c.get("sameSite") or c.get("same_site") or "lax").lower()
+                                if (c.get("sameSite") or c.get("same_site")) else "none",
+                    "secure": bool(c.get("secure")),
+                    "session": False,
+                    "storeId": "0",
+                    "value": c.get("value", ""),
+                }
+            z.writestr(stem + ".json", json.dumps([_ce(c) for c in cks], indent=2))
+            # info akun (non-cookie, biar array cookie tetap bersih)
+            z.writestr(stem + ".info.json", json.dumps({
                 "email": email, "verdict": r.get("verdict"), "user_id": r.get("user_id"),
                 "expires": r.get("expires"), "device_id": r.get("device_id"),
-                "cookies": [{"name": c["name"], "value": c["value"], "domain": c.get("domain", ".chatgpt.com"),
-                             "path": c.get("path", "/"), "secure": bool(c.get("secure")),
-                             "httpOnly": bool(c.get("httpOnly"))} for c in cks]}, indent=2))
+                "cookie_count": len(cks)}, indent=2))
             emails.append(f"{email}\t{r.get('verdict')}\t{r.get('expires')}\t{stem}")
         z.writestr("emails.txt", "\n".join(emails) + "\n")
         z.writestr("_readme.txt",
-                   "Cookie yang terbukti HIDUP (verdict VALID/GREEN) dari scan bulk.\n"
-                   "Tiap akun: <file>.txt (Netscape) + <file>.json (Playwright/extension).\n"
-                   "Cara pakai lihat emails.txt + doc di repo.\n")
+                   "Cookie yang terbukti HIDUP (verdict VALID/GREEN) dari scan bulk.\n\n"
+                   "FILE PER AKUN:\n"
+                   "  <file>.txt       -> Netscape (curl / wget / yt-dlp / Playwright load_cookies)\n"
+                   "  <file>.json      -> ARRAY POLOS, langsung import ke Cookie-Editor / EditThisCookie\n"
+                   "  <file>.info.json -> info akun (email, verdict, expires) - bukan cookie\n\n"
+                   "CARA IMPORT CEPAT (paling gampang):\n"
+                   "  1. Install ekstensi 'Cookie-Editor' di Chrome/Brave/Firefox\n"
+                   "  2. Buka https://chatgpt.com\n"
+                   "  3. Klik ikon Cookie-Editor -> Import -> pilih <file>.json -> Refresh\n"
+                   "  => sudah login.\n\n"
+                   "CARA MANUAL (tanpa ekstensi):\n"
+                   "  Buka chatgpt.com -> F12 -> Console -> paste isi <file>.json> lihat doc repo.\n")
     zbuf.seek(0)
     return Response(zbuf.getvalue(), media_type="application/zip",
                     headers={"Content-Disposition": "attachment; filename=alive_cookies.zip"})
