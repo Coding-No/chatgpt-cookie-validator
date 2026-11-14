@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from auto_parse import auto_parse, sniff_format
 from pydantic import BaseModel
 import requests
 
@@ -81,7 +82,26 @@ def parse_json_dump(d: dict | None) -> list[dict]:
 
 
 def parse_any(raw: str = "", json_dump: dict | None = None) -> list[dict]:
-    return parse_netscape(raw) if (raw or "").strip() else parse_json_dump(json_dump)
+    """Wrapper lama — tetap ada untuk kompatibilitas. Pakai auto-detect di bawah."""
+    if (raw or "").strip():
+        batches = auto_parse(raw)
+        return [c for b in batches for c in b["cookies"]]
+    return parse_json_dump(json_dump)
+
+
+def auto_batches(raw: str = "", json_dump: dict | None = None) -> list[dict]:
+    """Auto-detect multi-format -> list batch [{label,format,cookies}]."""
+    if (raw or "").strip():
+        return auto_parse(raw)
+    if json_dump:
+        cks = parse_json_dump(json_dump) or auto_parse(json.dumps(json_dump))[0]["cookies"] \
+            if isinstance(json_dump, dict) else parse_json_dump(json_dump)
+        if not cks:
+            bl = auto_parse(json.dumps(json_dump))
+            cks = [c for b in bl for c in b["cookies"]]
+        if cks:
+            return [{"label": "json-input", "format": "json", "cookies": cks}]
+    return []
 
 
 def cookie_dict(cookies: list[dict]) -> dict[str, str]:
@@ -239,28 +259,27 @@ def build_login_urls(cookies: list[dict]) -> dict:
 
 # =========================== batch helpers ============================
 def split_batch(raw: str) -> list[dict]:
-    """Pisah input batch. Delimiter: baris '=== <label> ===' atau blok dipisah 1+ baris kosong."""
+    """Pisah input batch — AUTO-DETECT (Netscape multi-blok, JSON, header-string, campur)."""
+    batches = auto_parse(raw)
+    if len(batches) > 1:
+        return [{"label": b["label"], "raw": None, "cookies": b["cookies"],
+                 "format": b["format"]} for b in batches]
+    # single batch: tetap pakai splitter delimiter lama kalau ada banyak blok
     items: list[dict] = []
     if re.search(r'^\s*===\s*.+?\s*===\s*$', raw, re.M):
         parts = re.split(r'^\s*===\s*(.+?)\s*===\s*$', raw, flags=re.M)
-        # parts: [pre, label1, body1, label2, body2, ...]
         for i in range(1, len(parts) - 1, 2):
-            label = parts[i].strip()
-            body = parts[i + 1].strip()
+            label, body = parts[i].strip(), parts[i + 1].strip()
             if body:
-                items.append({"label": label, "raw": body})
-    else:
-        chunks = re.split(r'\n\s*\n', raw.strip())
-        for idx, ch in enumerate(chunks, 1):
-            if ch.strip():
-                items.append({"label": f"cookie-{idx}", "raw": ch.strip()})
+                items.append({"label": label, "raw": body, "cookies": None, "format": None})
     return items
 
 
-def verify_one(label: str, raw: str) -> dict:
-    cookies = parse_any(raw=raw)
+def verify_one(label: str, raw: str, cookies: list[dict] | None = None,
+               fmt: str | None = None) -> dict:
+    cookies = cookies if cookies else parse_any(raw=raw)
     if not cookies:
-        return {"label": label, "ok": False, "verdict": "PARSE_ERROR",
+        return {"label": label, "ok": False, "verdict": "PARSE_ERROR", "format": fmt or "unknown",
                 "verdict_reason": "tidak ada cookie ter-parse", "user_email": None,
                 "token_len": 0, "backend_codes": "", "cookie_count": 0}
     off = offline_check(cookies)
@@ -268,7 +287,7 @@ def verify_one(label: str, raw: str) -> dict:
     u = live.get("user") or {}
     codes = ";".join(f"{b['endpoint']}={b.get('status')}:{b.get('code','')}"
                      for b in live.get("backend", []))
-    return {"label": label, "ok": True, "verdict": live["verdict"],
+    return {"label": label, "ok": True, "verdict": live["verdict"], "format": fmt or "auto",
             "verdict_reason": live["verdict_reason"], "user_email": u.get("email"),
             "user_name": u.get("name"), "user_id": u.get("id"),
             "expires": live.get("expires"), "token_len": live.get("access_token_len", 0),
@@ -393,8 +412,10 @@ def index():
 def api_check(body: CookieIn):
     cookies = parse_any(body.raw, body.json_dump)
     if not cookies:
-        raise HTTPException(400, "Tidak ada cookie ter-parse (format Netscape/JSON).")
+        raise HTTPException(400, "Tidak ada cookie ter-parse (format apapun: Netscape/JSON/header-string/DevTools).")
+    fmt_info = sniff_format(body.raw or json.dumps(body.json_dump or {}))
     return JSONResponse({"ok": True, "parsed_count": len(cookies),
+                         "format_info": fmt_info,
                          "offline": offline_check(cookies), "live": live_verify(cookies),
                          "urls": build_login_urls(cookies), "ts": int(time.time())})
 
@@ -443,7 +464,7 @@ def api_batch(body: BatchIn):
     conc = max(1, min(int(body.concurrency or 4), 12))
 
     def worker(it):
-        res = verify_one(it["label"], it["raw"])
+        res = verify_one(it["label"], it.get("raw") or "", it.get("cookies"), it.get("format"))
         with lock:
             results.append(res)
             print(f"[batch] {res['label']:24} {res['verdict']:12} {res.get('user_email')}")
@@ -586,9 +607,16 @@ input[type=number]{background:#010409;color:#c9d1d9;border:1px solid #30363d;bor
 
 <!-- ===== SINGLE ===== -->
 <div class="panel active" id="p-single">
-<textarea id="raw" placeholder="# Netscape HTTP Cookie File
+<textarea id="raw" placeholder="Paste cookie format APAPUN — auto-detect:
+• Netscape (tab-separated, 7 kolom)
+• JSON (array cookie / {cookies:[...]} / {name,value} objek)
+• Header string:  a=1; b=2; oai-did=...
+• DevTools / EditThisCookie / Cookie-Editor export
+• Campur / banyak blok sekaligus (auto-dipisah)
+
+Contoh Netscape:
 chatgpt.com	FALSE	/	FALSE	1812869199	oai-hlib	true
-.chatgpt.com	TRUE	/	FALSE	1812836823	oai-did	7100c66c-....
+.chatgpt.com	TRUE	/	TRUE	1802149501	__Secure-next-auth.session-token.0	PASTE_TOKEN
 ..."></textarea>
 <div class="row">
   <button onclick="check()">🔍 Cek Cookie</button>
@@ -602,13 +630,17 @@ chatgpt.com	FALSE	/	FALSE	1812869199	oai-hlib	true
 
 <!-- ===== BATCH ===== -->
 <div class="panel" id="p-batch">
-<div class="muted">Pisahkan tiap cookie dengan baris <code>=== nama ===</code> (atau 1 baris kosong).</div>
+<div class="muted">Paste APAPUN (auto-detect): Netscape · JSON · header-string · DevTools · banyak blok campur. Tiap entri dipisah otomatis (=== nama ===, baris kosong, atau blok JSON/netscape berurutan).</div>
 <textarea id="rawb" style="height:260px" placeholder="=== akun-1 ===
 chatgpt.com	FALSE	/	FALSE	1812869199	oai-hlib	true
-.chatgpt.com	TRUE	/	FALSE	1812836823	oai-did	....
+.chatgpt.com	TRUE	/	TRUE	1802149501	__Secure-next-auth.session-token.0	....
 
 === akun-2 ===
-..."></textarea>
+[{"name":"oai-did","value":"...","domain":".chatgpt.com"},
+ {"name":"__Secure-next-auth.session-token.0","value":"..."}]
+
+akun-3: oai-did=...; oai-hlib=true; __Secure-next-auth.session-token.0=...
+(Pisahkan bebas: '=== label ===', baris kosong, atau sequential block — semua auto-kenal)"></textarea>
 <div class="row">
   <button onclick="runBatch()">📚 Cek Semua</button>
   <label class="muted">Concurrency <input type="number" id="conc" value="4" min="1" max="12"></label>
@@ -674,7 +706,7 @@ function render(d){
   let h=`<div class="card"><div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
     <span class="badge v-${esc(L.verdict)}">${esc(L.verdict)}</span><b>${esc(L.verdict_reason)}</b></div>
     <table>
-    <tr><th>Cookie parsed</th><td>${d.parsed_count} (alive ${O.alive} / expired ${O.expired})</td></tr>
+    <tr><th>Cookie parsed</th><td>${d.parsed_count} (alive ${O.alive} / expired ${O.expired})${d.format_info?' &nbsp;<span class="badge v-VALID" title="'+esc(d.format_info.detail||'')+'">🎯 auto-detect: '+esc(d.format_info.format)+'</span>':' <span class="badge v-PARTIAL">⏳ parsing…</span>'}</td></tr>
     <tr><th>Email</th><td>${esc(u.email)||'<span class=warn>tidak ada</span>'}</td></tr>
     <tr><th>Nama</th><td>${esc(u.name)||'-'}</td></tr>
     <tr><th>User ID</th><td>${esc(u.id)||'-'}</td></tr>
@@ -716,7 +748,7 @@ async function runBatch(){
     const r=await fetch('/api/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw,concurrency:conc})});
     const d=await r.json();
     if(!r.ok){out.innerHTML='<div class="card bad">Error: '+esc(d.detail||JSON.stringify(d))+'</div>';return;}
-    let h='<div class="card"><b>Ringkasan:</b> '+Object.entries(d.summary).map(([k,v])=>`<span class="badge v-${esc(k)}">${esc(k)}: ${v}</span>`).join(' ')+'</div>';
+    let h='<div class="card"><b>Ringkasan:</b> '+Object.entries(d.summary).map(([k,v])=>`<span class="badge v-${esc(k)}">${esc(k)}: ${v}</span>`).join(' ')+` &nbsp; <span class="muted">(${d.results.length} entri terdeteksi otomatis)</span></div>`;
     h+='<div class="card"><table><tr><th>Label</th><th>Verdict</th><th>Email</th><th>Token</th><th>Alive/Exp</th><th>Backend</th></tr>';
     d.results.forEach(rr=>{h+=`<tr><td>${esc(rr.label)}</td><td><span class="badge v-${esc(rr.verdict)}">${esc(rr.verdict)}</span></td>
       <td>${esc(rr.user_email)||'-'}</td><td>${rr.token_len||0}</td><td>${rr.cookie_alive||0}/${rr.cookie_expired||0}</td><td class="muted">${esc(rr.backend_codes)}</td></tr>`;});

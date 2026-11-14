@@ -111,3 +111,21 @@ MIT — lihat [LICENSE](LICENSE).
 Alat ini untuk menguji sesi/cookie yang **kamu miliki atau punya izin eksplisit** untuk diuji.
 Penggunaan terhadap akun milik orang lain tanpa izin melanggar hukum. Penulis tidak bertanggung
 jawab atas penyalahgunaan.
+
+
+## 🎯 Auto-Detect Format Input (v2.1)
+
+Kamu **tidak perlu** memilih format — paste apapun, parser deteksi sendiri:
+
+| Format | Contoh |
+|---|---|
+| **Netscape** | 7 kolom tab-separated (`domain\tflag\tpath\tsecure\texpiry\tname\tvalue`) |
+| **JSON cookies-list** | `{"cookies":[{"name":...,"value":...}]}` atau array `[{...}]` |
+| **JSON objek** | `{"name":"value"}` (flat) |
+| **Header string** | `a=1; b=2; oai-did=...` |
+| **DevTools** | hasil edit cookie / "Copy as cURL" |
+| **Bulk / mixed** | banyak blok campur format, dipisah `=== label ===`, baris kosong, atau otomatis |
+
+Parser juga toleran: koma trailing, BOM, `//` komentar, chunking `...token.0/1`,
+domain tanpa leading-dot, expiry ISO, dll.
+
