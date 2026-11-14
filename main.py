@@ -18,6 +18,10 @@ try:
     import profiles as PROF
 except Exception:  # pragma: no cover
     PROF = None
+try:
+    import remote as REMOTE
+except Exception:  # pragma: no cover
+    REMOTE = None
 from pathlib import Path
 from typing import Any
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
@@ -931,6 +935,103 @@ def profiles_dashboard():
     return HTMLResponse(PROF.dashboard_html())
 
 
+# -------- remote device (browser jalan di device user) --------
+class RegisterDeviceIn(BaseModel):
+    host: str
+    port: int = 9222
+    label: str = ""
+
+
+class InjectDeviceIn(BaseModel):
+    dev_id: str = ""
+    slug: str = ""
+    email: str = ""
+    url: str = "https://chatgpt.com/"
+    open_new_tab: bool = True
+    close_others: bool = False
+
+
+@app.get("/api/remote/script")
+def api_remote_script():
+    """Download script yang dijalankan DI DEVICE user buat buka browser dgn CDP."""
+    from fastapi.responses import FileResponse
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "device_browser.sh")
+    if not os.path.exists(p):
+        raise HTTPException(404, "script tidak ada")
+    return FileResponse(p, media_type="text/x-shellscript", filename="device_browser.sh")
+
+
+@app.get("/api/remote/instructions")
+def api_remote_instructions():
+    if REMOTE is None:
+        raise HTTPException(500, "modul remote tidak termuat")
+    return REMOTE.instructions()
+
+
+@app.get("/api/remote/device.sh")
+def api_remote_device_sh():
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(REMOTE.device_script(), media_type="text/x-shellscript")
+
+
+@app.get("/api/remote/tunnel.sh")
+def api_remote_tunnel_sh():
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(REMOTE.tunnel_script(), media_type="text/x-shellscript")
+
+
+@app.get("/api/remote/devices")
+def api_remote_devices():
+    if REMOTE is None:
+        raise HTTPException(500, "modul remote tidak termuat")
+    devs = REMOTE.list_devices()
+    return {"ok": True, "count": len(devs), "devices": devs}
+
+
+@app.post("/api/remote/register")
+def api_remote_register(inp: RegisterDeviceIn):
+    if REMOTE is None:
+        raise HTTPException(500, "modul remote tidak termuat")
+    return REMOTE.register_device(inp.host, inp.port, inp.label)
+
+
+@app.delete("/api/remote/device/{dev_id}")
+def api_remote_remove(dev_id: str):
+    if REMOTE is None:
+        raise HTTPException(500, "modul remote tidak termuat")
+    return REMOTE.remove_device(dev_id)
+
+
+@app.post("/api/remote/inject")
+def api_remote_inject(inp: InjectDeviceIn):
+    if REMOTE is None:
+        raise HTTPException(500, "modul remote tidak termuat")
+    # ambil cookie dari profil (by slug atau email) atau dari bulk hasil VALID
+    cookies = None
+    if inp.slug and PROF:
+        ck = PROF._load_cookies(PROF.PROFILES_DIR / inp.slug)
+        if ck:
+            cookies = ck
+    if not cookies and inp.email and PROF:
+        for m in PROF.list_profiles():
+            if (m.get("email") or "").lower() == inp.email.lower():
+                cookies = PROF._load_cookies(Path(m["dir"]))
+                break
+    if not cookies:
+        # fallback: ambil dari hasil bulk by email
+        try:
+            data = json.loads(BULK_STORE.read_text())
+            for r in data.get("results", []):
+                if inp.email and (r.get("user_email") or "").lower() == inp.email.lower() and r.get("cookies"):
+                    cookies = r["cookies"]
+                    break
+        except Exception:
+            pass
+    if not cookies:
+        raise HTTPException(404, "cookie tidak ditemukan untuk slug/email itu")
+    return REMOTE.inject_to_device(inp.dev_id, cookies, inp.url, inp.open_new_tab, inp.close_others)
+
+
 # -------- brave --------
 @app.get("/api/brave/status")
 def api_brave_status():
@@ -1094,21 +1195,45 @@ akun-3: oai-did=...; oai-hlib=true; __Secure-next-auth.session-token.0=...
 <!-- ===== BANYAK AKUN ===== -->
 <div class="panel" id="p-multi">
 <div class="card">
-  <b>🧑‍💻 Masuk Banyak Akun Sekaligus — Gampang</b>
+  <b>📡 Server = server, Browser di DEVICE kamu</b>
   <div class="muted" style="margin:8px 0">
-    Tiap akun = <b>1 profil Brave terpisah</b> (cookie nempel permanen). Setelah diimport, tinggal
-    klik <b>▶️ Buka</b> → jendela Brave kebuka <b>langsung login</b>. Bisa banyak akun jalan bareng.
+    Brave <b>tidak</b> dibuka di server. Kamu jalankan browser di device sendiri
+    (laptop/HP), lalu server cuma <i>nyetir</i> lewat remote debugging. Jendela muncul <b>di device kamu</b>.
+  </div>
+  <details style="margin:6px 0">
+    <summary class="muted" style="cursor:pointer">📖 Cara setup device (klik)</summary>
+    <ol class="muted" style="margin:8px 0;padding-left:20px">
+      <li>Di device kamu, download script: <a href="/api/remote/device.sh" download="device_browser.sh">device_browser.sh</a> → jalankan <code>bash device_browser.sh 9222</code></li>
+      <li>Kalau server tak bisa connect (firewall), download <a href="/api/remote/tunnel.sh" download="tunnel_from_device.sh">tunnel_from_device.sh</a> → jalankan <code>bash tunnel_from_device.sh nopauwxp@100.95.162.3 9222</code></li>
+      <li>Di sini: isi <b>Host/IP device</b> → klik <b>Cek device</b>. Kalau lampu hijau 🟢, siap.</li>
+      <li>Klik <b>📡 Buka di device</b> pada akun yang mau → jendela browser kebuka di device, sudah login.</li>
+    </ol>
+  </details>
+  <div class="row">
+    <input id="dev_host" placeholder="host/IP device (mis. 100.122.208.35)" style="flex:1;min-width:200px">
+    <label class="muted">port <input type="number" id="dev_port" value="9222" style="width:90px"></label>
+    <button onclick="devRegister()">🔌 Cek device</button>
+    <button class="alt" onclick="devList()">🔄 Refresh device</button>
+  </div>
+  <div id="dev_list" class="muted">Belum ada device terdaftar.</div>
+  <div class="muted" id="dev_msg"></div>
+</div>
+<div class="card">
+  <b>🧑‍💻 Akun tersimpan (profil)</b>
+  <div class="muted" style="margin:8px 0">
+    Tiap akun = <b>1 profil terpisah</b> (cookie tersimpan permanen di server). Klik
+    <b>📡 Buka di device</b> → cookie di-inject ke browser device, ChatGPT kebuka sudah login.
+    <b>▶️ Server</b> = buka browser di server (opsional, kalau kamu mau).
   </div>
   <div class="row">
     <button onclick="pmImport()">📥 Import dari hasil scan (VALID+PARTIAL)</button>
-    <button class="alt" onclick="pmLaunchAll('VALID')">▶️ Buka semua yg VALID</button>
+    <button class="alt" onclick="pmLaunchAll('VALID')">▶️ Buka semua di server (VALID)</button>
     <button class="alt" onclick="pmLoad()">🔄 Refresh</button>
-    <a class="muted" href="/profiles" target="_blank" style="align-self:center">buka dashboard penuh ↗</a>
+    <a class="muted" href="/profiles" target="_blank" style="align-self:center">dashboard penuh ↗</a>
   </div>
   <div class="muted" id="pm_msg"></div>
 </div>
 <div id="pm_list"></div>
-<div class="muted" style="margin-top:8px">Tip: kalau Brave nggak kelihatan, klik <b>🕶️ Headless</b> (mode tanpa jendela, buat otomasi). Untuk GUI, pastikan sesi desktop aktif.</div>
 </div>
 
 <!-- ===== BRAVE ===== -->
@@ -1146,7 +1271,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   t.classList.add('active');
   document.getElementById('p-'+t.dataset.t).classList.add('active');
   if(t.dataset.t==='brave') braveStatus();
-  if(t.dataset.t==='multi') pmLoad();
+  if(t.dataset.t==='multi'){pmLoad();devList();}
 });
 
 let lastRaw='';
@@ -1322,8 +1447,8 @@ async function pmLoad(){
         h+='<tr><td>'+(p.running?'🟢 jalan':'⚪ mati')+'</td><td>'+esc(p.email||'-')+'</td>'
           +'<td><span class="badge v-'+esc(p.verdict)+'">'+esc(p.verdict||'-')+'</span></td>'
           +'<td>'+p.cookie_count+'</td><td class="muted">'+esc(p.expires||'-')+'</td>'
-          +'<td><button onclick="pmOpen(\''+p.slug+'\',false)">▶️ Buka</button> '
-          +'<button class="alt" onclick="pmOpen(\''+p.slug+'\',true)">🕶️ Headless</button> '
+          +'<td><button onclick="pmOpenDevice(\''+p.slug+'\',\''+String(p.email||'').replace(/'/g,'')+'\')">📡 Buka di device</button> '
+          +'<button class="alt" onclick="pmOpen(\''+p.slug+'\',false)">▶️ Server</button> '
           +'<button class="alt" onclick="pmKill(\''+p.slug+'\')">⏹️</button> '
           +'<button class="alt" onclick="pmDel(\''+p.slug+'\')">🗑️</button></td></tr>';
       });
@@ -1366,6 +1491,50 @@ async function pmKill(slug){
 async function pmDel(slug){
   if(!confirm('Hapus profil '+slug+' beserta cookienya?'))return;
   try{await fetch('/api/profiles/'+slug,{method:'DELETE'});pmMsg('🗑️ '+slug+' dihapus');pmLoad();}catch(e){}
+}
+
+// ---- remote device (browser di device user) ----
+function devMsg(t){document.getElementById('dev_msg').textContent=t;}
+async function devRegister(){
+  const host=document.getElementById('dev_host').value.trim();
+  const port=parseInt(document.getElementById('dev_port').value||'9222');
+  if(!host){alert('Isi host/IP device dulu');return;}
+  devMsg('🔌 Cek device '+host+':'+port+' ...');
+  try{
+    const r=await fetch('/api/remote/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host,port})});
+    const d=await r.json();
+    devMsg(d.ok?('🟢 Device online: '+(d.device&&d.device.version||'')):('❌ '+(d.error||'')));
+    devList();
+  }catch(e){devMsg('❌ '+e.message);}
+}
+async function devList(){
+  try{
+    const r=await fetch('/api/remote/devices');const d=await r.json();
+    if(!d.count){document.getElementById('dev_list').innerHTML='<span class="muted">Belum ada device. Isi host lalu klik Cek device.</span>';return;}
+    let h='<table><tr><th>Device</th><th>Status</th><th>Browser</th><th></th></tr>';
+    d.devices.forEach(v=>{h+='<tr><td>'+esc(v.label)+' <span class="muted">'+esc(v.host)+':'+v.port+'</span></td>'
+      +'<td>'+(v.online?'🟢 online':'🔴 offline')+'</td><td class="muted">'+esc(v.version||'-')+'</td>'
+      +'<td><button class="alt" onclick="devForget(\''+esc(v.id)+'\')">lupakan</button></td></tr>';});
+    h+='</table>';
+    document.getElementById('dev_list').innerHTML=h;
+  }catch(e){document.getElementById('dev_list').innerHTML='<span class="bad">'+esc(e.message)+'</span>';}
+}
+async function devForget(id){try{await fetch('/api/remote/device/'+encodeURIComponent(id),{method:'DELETE'});devList();}catch(e){}}
+let _devPick=null;
+async function pmOpenDevice(slug,email){
+  const r=await fetch('/api/remote/devices');const d=await r.json();
+  const on=(d.devices||[]).filter(v=>v.online);
+  if(!on.length){alert('Belum ada device online. Isi host/IP device kamu di atas, klik "Cek device" dulu.');return;}
+  let dev=on[0];
+  if(on.length>1){const pick=prompt('Pilih device (tulis nomor):\n'+on.map((v,i)=>(i+1)+'. '+v.label+' '+v.host).join('\n'),'1');
+    const i=parseInt(pick||'1')-1; if(on[i])dev=on[i];}
+  pmMsg('📡 Buka '+email+' di device '+dev.label+'...');
+  try{
+    const rr=await fetch('/api/remote/inject',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({dev_id:dev.id,slug,email,url:'https://chatgpt.com/',open_new_tab:true})});
+    const dd=await rr.json();
+    pmMsg(dd.ok?('✅ Terbuka di device '+dev.label+' · '+dd.injected+' cookie · '+(dd.title||'')):('❌ '+(dd.error||JSON.stringify(dd))));
+  }catch(e){pmMsg('❌ '+e.message);}
 }
 
 // ---- brave ----
