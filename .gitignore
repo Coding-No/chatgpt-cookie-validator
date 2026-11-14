@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# runtime
+batch_last.json
+brave_cdp.log
+*.log
+
+# secrets / dumps (JANGAN commit cookie!)
+*.txt
+!requirements.txt
+*cookies*.json
+chatgpt_*
+payload*.json
+
+# os
+.DS_Store
+Thumbs.db
