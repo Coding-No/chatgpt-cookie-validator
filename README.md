@@ -129,3 +129,45 @@ Kamu **tidak perlu** memilih format — paste apapun, parser deteksi sendiri:
 Parser juga toleran: koma trailing, BOM, `//` komentar, chunking `...token.0/1`,
 domain tanpa leading-dot, expiry ISO, dll.
 
+
+
+## 🌐 Akses via Tailscale
+
+Server default bind `127.0.0.1`. Untuk akses dari device lain di Tailnet:
+
+### 1. Bind ke semua interface
+```bash
+HOST=0.0.0.0 PORT=8787 ./run.sh
+```
+
+### 2. Akses langsung via IP Tailscale
+```bash
+tailscale ip -4          # contoh: 100.95.162.3
+# buka: http://100.95.162.3:8787
+```
+
+### 3. Akses via HTTPS Tailnet (rapi, tanpa buka port)
+```bash
+tailscale serve --bg --https=8446 http://127.0.0.1:8787
+# buka: https://<host>.<tailnet>.ts.net:8446
+```
+
+### 4. Autostart permanen (systemd user service)
+```ini
+# ~/.config/systemd/user/chatgpt-cookie-validator.service
+[Unit]
+Description=ChatGPT Cookie Validator
+After=network-online.target
+[Service]
+WorkingDirectory=/path/to/app
+ExecStart=<venv>/python3 -m uvicorn main:app --host 0.0.0.0 --port 8787
+Restart=always
+[Install]
+WantedBy=default.target
+```
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now chatgpt-cookie-validator.service
+systemctl --user status chatgpt-cookie-validator.service
+```
+
