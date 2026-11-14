@@ -13,7 +13,11 @@ Fitur v2:
 - Endpoint publik: jalankan uvicorn --host 0.0.0.0 (lihat run.sh)
 """
 from __future__ import annotations
-import base64, json, time, uuid, hashlib, os, csv, io, threading, subprocess, shutil, re
+import base64, json, time, uuid, hashlib, os, csv, io, threading, subprocess, shutil, re, zipfile
+try:
+    import profiles as PROF
+except Exception:  # pragma: no cover
+    PROF = None
 from pathlib import Path
 from typing import Any
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
@@ -278,7 +282,7 @@ def split_batch(raw: str) -> list[dict]:
 
 
 def verify_one(label: str, raw: str, cookies: list[dict] | None = None,
-               fmt: str | None = None) -> dict:
+               fmt: str | None = None, keep_cookies: bool = False) -> dict:
     cookies = cookies if cookies else parse_any(raw=raw)
     if not cookies:
         return {"label": label, "ok": False, "verdict": "PARSE_ERROR", "format": fmt or "unknown",
@@ -289,13 +293,31 @@ def verify_one(label: str, raw: str, cookies: list[dict] | None = None,
     u = live.get("user") or {}
     codes = ";".join(f"{b['endpoint']}={b.get('status')}:{b.get('code','')}"
                      for b in live.get("backend", []))
-    return {"label": label, "ok": True, "verdict": live["verdict"], "format": fmt or "auto",
-            "verdict_reason": live["verdict_reason"], "user_email": u.get("email"),
-            "user_name": u.get("name"), "user_id": u.get("id"),
-            "expires": live.get("expires"), "token_len": live.get("access_token_len", 0),
-            "cookie_alive": off["alive"], "cookie_expired": off["expired"],
-            "cookie_count": off["total"], "backend_codes": codes,
-            "device_id": live.get("device_id")}
+    out = {"label": label, "ok": True, "verdict": live["verdict"], "format": fmt or "auto",
+           "verdict_reason": live["verdict_reason"], "user_email": u.get("email"),
+           "user_name": u.get("name"), "user_id": u.get("id"),
+           "expires": live.get("expires"), "token_len": live.get("access_token_len", 0),
+           "cookie_alive": off["alive"], "cookie_expired": off["expired"],
+           "cookie_count": off["total"], "backend_codes": codes,
+           "device_id": live.get("device_id")}
+    if keep_cookies:
+        # simpan raw cookie (buat export ZIP alive) — bentuk seragam
+        sess_exp = None
+        try:  # Netscape wajib expiry numeric >0; ambil dari session bila cookie tak punya
+            import datetime as _dt
+            if result.get("expires"):
+                sess_exp = int(_dt.datetime.fromisoformat(
+                    result["expires"].replace("Z", "+00:00")).timestamp())
+        except Exception:
+            sess_exp = None
+        out["cookies"] = [{"name": c.get("name"), "value": c.get("value"),
+                           "domain": c.get("domain", ".chatgpt.com"),
+                           "path": c.get("path", "/"), "secure": bool(c.get("secure")),
+                           "httpOnly": bool(c.get("httpOnly")),
+                           "expiry_epoch": (c.get("expiry_epoch") or c.get("expires")
+                                            or sess_exp)}
+                          for c in cookies if c.get("name")]
+    return out
 
 
 # ============================ Brave inject ============================
@@ -542,7 +564,7 @@ def _bulk_items_to_results(items: list[dict], concurrency: int = 6) -> dict:
                 it = q[idx["i"]]
                 idx["i"] += 1
             res = verify_one(it.get("label") or "item", it.get("raw") or "",
-                             it.get("cookies"), it.get("format"))
+                             it.get("cookies"), it.get("format"), keep_cookies=True)
             # pecah: tiap file bisa >1 target (bulk multi-target dalam 1 file)
             tgts = it.get("_targets")
             with lock:
@@ -606,7 +628,7 @@ def _run_bulk_job(job_id: str, items: list, files_total: int, concurrency: int):
                     return
                 it = q[idx["i"]]; idx["i"] += 1
             res = verify_one(it.get("label") or "item", it.get("raw") or "",
-                             it.get("cookies"), it.get("format"))
+                             it.get("cookies"), it.get("format"), keep_cookies=True)
             tgts = it.get("_targets")
             with lock:
                 if tgts and len(tgts) > 1:
@@ -738,10 +760,16 @@ def api_bulk_paste(body: CookieIn, concurrency: int = 6):
 
 
 @app.get("/api/bulk/export")
-def api_bulk_export(fmt: str = Query("csv")):
+def api_bulk_export(fmt: str = Query("csv"), only: str = Query("")):
     if not BULK_STORE.exists():
         raise HTTPException(404, "Belum ada hasil bulk.")
     data = json.loads(BULK_STORE.read_text())
+    results = data.get("results", [])
+    if only:  # filter verdict: only=VALID  atau  only=VALID,PARTIAL
+        want = {x.strip().upper() for x in only.split(",") if x.strip()}
+        results = [r for r in results if (r.get("verdict") or "").upper() in want]
+        data = {**data, "results": results,
+                "summary": {w: sum(1 for r in results if (r.get("verdict") or "").upper() == w) for w in want}}
     cols = ["label", "target", "verdict", "user_email", "user_name", "user_id", "expires",
             "token_len", "cookie_alive", "cookie_expired", "cookie_count",
             "backend_codes", "device_id", "verdict_reason"]
@@ -780,6 +808,127 @@ def api_bulk_export(fmt: str = Query("csv")):
         w.writerow(r)
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=bulk_results.csv"})
+
+
+@app.get("/api/bulk/alive.zip")
+def api_bulk_alive_zip(only: str = Query("VALID,PARTIAL")):
+    """ZIP berisi file .txt Netscape + .json + emails.txt untuk cookie terbukti hidup/tidak-revoked."""
+    if not BULK_STORE.exists():
+        raise HTTPException(404, "Belum ada hasil bulk.")
+    data = json.loads(BULK_STORE.read_text())
+    want = {x.strip().upper() for x in only.split(",") if x.strip()}
+    alive = [r for r in data.get("results", [])
+             if (r.get("verdict") or "").upper() in want and r.get("cookies")]
+    if not alive:
+        raise HTTPException(404, "Tidak ada cookie hidup di hasil terakhir.")
+    zbuf = io.BytesIO()
+    emails = []
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, r in enumerate(alive, 1):
+            email = r.get("user_email") or "unknown"
+            safe = "".join(ch if ch.isalnum() or ch in "@._-" else "_" for ch in email)
+            stem = f"{i:04d}_{r.get('verdict','X')}_{safe}"
+            cks = r["cookies"]
+            sess_exp = 0
+            try:
+                import datetime as _dt
+                if r.get("expires"):
+                    sess_exp = int(_dt.datetime.fromisoformat(
+                        r["expires"].replace("Z", "+00:00")).timestamp())
+            except Exception:
+                sess_exp = 0
+            # Netscape
+            lines = ["# Netscape HTTP Cookie File"]
+            for c in cks:
+                dom = c.get("domain", ".chatgpt.com")
+                inc = "TRUE" if dom.startswith(".") else "FALSE"
+                sec = "TRUE" if c.get("secure") else "FALSE"
+                raw_exp = c.get("expiry_epoch") or c.get("expires") or sess_exp or 0
+                exp = int(raw_exp) if str(raw_exp).replace(".", "").isdigit() else 0
+                lines.append("\t".join([dom, inc, c.get("path", "/"), sec, str(exp), c.get("name", ""), c.get("value", "")]))
+            z.writestr(stem + ".txt", "\n".join(lines) + "\n")
+            # JSON (Playwright format siap pakai)
+            z.writestr(stem + ".json", json.dumps({
+                "email": email, "verdict": r.get("verdict"), "user_id": r.get("user_id"),
+                "expires": r.get("expires"), "device_id": r.get("device_id"),
+                "cookies": [{"name": c["name"], "value": c["value"], "domain": c.get("domain", ".chatgpt.com"),
+                             "path": c.get("path", "/"), "secure": bool(c.get("secure")),
+                             "httpOnly": bool(c.get("httpOnly"))} for c in cks]}, indent=2))
+            emails.append(f"{email}\t{r.get('verdict')}\t{r.get('expires')}\t{stem}")
+        z.writestr("emails.txt", "\n".join(emails) + "\n")
+        z.writestr("_readme.txt",
+                   "Cookie yang terbukti HIDUP (verdict VALID/GREEN) dari scan bulk.\n"
+                   "Tiap akun: <file>.txt (Netscape) + <file>.json (Playwright/extension).\n"
+                   "Cara pakai lihat emails.txt + doc di repo.\n")
+    zbuf.seek(0)
+    return Response(zbuf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": "attachment; filename=alive_cookies.zip"})
+
+
+# -------- profile manager (banyak akun) --------
+class ImportProfilesIn(BaseModel):
+    only: list[str] = ["VALID", "PARTIAL"]
+    limit: int | None = None
+
+
+class LaunchProfileIn(BaseModel):
+    headless: bool = False
+
+
+class LaunchAllIn(BaseModel):
+    verdicts: list[str] = ["VALID"]
+    headless: bool = False
+    max_launch: int = 8
+
+
+@app.get("/api/profiles")
+def api_profiles():
+    if not PROF:
+        raise HTTPException(500, "modul profiles.py tidak ter-load")
+    items = PROF.list_profiles()
+    return {"ok": True, "count": len(items), "dir": str(PROF.PROFILES_DIR), "profiles": items}
+
+
+@app.post("/api/profiles/import")
+def api_profiles_import(body: ImportProfilesIn):
+    if not PROF:
+        raise HTTPException(500, "modul profiles.py tidak ter-load")
+    return JSONResponse(PROF.import_from_bulk(tuple(body.only), body.limit))
+
+
+@app.post("/api/profiles/launch_all")
+def api_profiles_launch_all(body: LaunchAllIn):
+    if not PROF:
+        raise HTTPException(500, "modul profiles.py tidak ter-load")
+    return JSONResponse(PROF.launch_all(tuple(body.verdicts), body.headless, max_launch=body.max_launch))
+
+
+@app.post("/api/profiles/{slug}/launch")
+def api_profiles_launch(slug: str, body: LaunchProfileIn):
+    if not PROF:
+        raise HTTPException(500, "modul profiles.py tidak ter-load")
+    return JSONResponse(PROF.launch_profile(slug, headless=body.headless))
+
+
+@app.post("/api/profiles/{slug}/kill")
+def api_profiles_kill(slug: str):
+    if not PROF:
+        raise HTTPException(500, "modul profiles.py tidak ter-load")
+    return JSONResponse(PROF.kill_profile(slug))
+
+
+@app.delete("/api/profiles/{slug}")
+def api_profiles_delete(slug: str):
+    if not PROF:
+        raise HTTPException(500, "modul profiles.py tidak ter-load")
+    return JSONResponse(PROF.delete_profile(slug))
+
+
+@app.get("/profiles", response_class=HTMLResponse)
+def profiles_dashboard():
+    if not PROF:
+        raise HTTPException(500, "modul profiles.py tidak ter-load")
+    return HTMLResponse(PROF.dashboard_html())
 
 
 # -------- brave --------
@@ -865,6 +1014,7 @@ input[type=number]{background:#010409;color:#c9d1d9;border:1px solid #30363d;bor
   <div class="tab active" data-t="single">🔍 Cek Tunggal</div>
   <div class="tab" data-t="batch">📚 Batch</div>
   <div class="tab" data-t="bulk">📦 Bulk ZIP</div>
+  <div class="tab" data-t="multi">🧑‍💻 Banyak Akun</div>
   <div class="tab" data-t="brave">🚀 Auto-Login Brave</div>
 </div>
 
@@ -935,9 +1085,30 @@ akun-3: oai-did=...; oai-hlib=true; __Secure-next-auth.session-token.0=...
     <button class="alt" onclick="downloadBulk('csv')" id="bulkdl1" disabled>⬇️ CSV</button>
     <button class="alt" onclick="downloadBulk('json')" id="bulkdl2" disabled>⬇️ JSON</button>
     <button class="alt" onclick="downloadBulk('xlsx')" id="bulkdl3" disabled>⬇️ XLSX</button>
+    <button onclick="downloadAlive()" id="bulkdl4" disabled>💚 Cookie VALID (ZIP siap pakai)</button>
   </div>
 </div>
 <div id="outk"></div>
+</div>
+
+<!-- ===== BANYAK AKUN ===== -->
+<div class="panel" id="p-multi">
+<div class="card">
+  <b>🧑‍💻 Masuk Banyak Akun Sekaligus — Gampang</b>
+  <div class="muted" style="margin:8px 0">
+    Tiap akun = <b>1 profil Brave terpisah</b> (cookie nempel permanen). Setelah diimport, tinggal
+    klik <b>▶️ Buka</b> → jendela Brave kebuka <b>langsung login</b>. Bisa banyak akun jalan bareng.
+  </div>
+  <div class="row">
+    <button onclick="pmImport()">📥 Import dari hasil scan (VALID+PARTIAL)</button>
+    <button class="alt" onclick="pmLaunchAll('VALID')">▶️ Buka semua yg VALID</button>
+    <button class="alt" onclick="pmLoad()">🔄 Refresh</button>
+    <a class="muted" href="/profiles" target="_blank" style="align-self:center">buka dashboard penuh ↗</a>
+  </div>
+  <div class="muted" id="pm_msg"></div>
+</div>
+<div id="pm_list"></div>
+<div class="muted" style="margin-top:8px">Tip: kalau Brave nggak kelihatan, klik <b>🕶️ Headless</b> (mode tanpa jendela, buat otomasi). Untuk GUI, pastikan sesi desktop aktif.</div>
 </div>
 
 <!-- ===== BRAVE ===== -->
@@ -975,6 +1146,7 @@ document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
   t.classList.add('active');
   document.getElementById('p-'+t.dataset.t).classList.add('active');
   if(t.dataset.t==='brave') braveStatus();
+  if(t.dataset.t==='multi') pmLoad();
 });
 
 let lastRaw='';
@@ -1134,9 +1306,67 @@ function renderBulk(d){
     <td>${r.token_len||0}</td><td>${r.cookie_alive||0}/${r.cookie_expired||0}</td><td class="muted">${esc(r.backend_codes)}</td></tr>`;});
   h+='</table></div>';
   document.getElementById('outk').innerHTML=h;
-  ['bulkdl1','bulkdl2','bulkdl3'].forEach(id=>document.getElementById(id).disabled=false);
+  ['bulkdl1','bulkdl2','bulkdl3','bulkdl4'].forEach(id=>{const e=document.getElementById(id); if(e)e.disabled=false;});
 }
 function downloadBulk(fmt){window.location='/api/bulk/export?fmt='+fmt;}
+function downloadAlive(){window.location='/api/bulk/alive.zip?only=VALID,PARTIAL';}
+
+// ---- profile manager (banyak akun) ----
+async function pmLoad(){
+  try{
+    const r=await fetch('/api/profiles');const d=await r.json();
+    let h='<div class="card"><b>📋 '+(d.count||0)+' akun tersimpan</b></div>';
+    if(d.count){
+      h+='<div class="card"><table><tr><th>Status</th><th>Email</th><th>Verdict</th><th>Cookie</th><th>Expires</th><th>Aksi</th></tr>';
+      d.profiles.forEach(p=>{
+        h+='<tr><td>'+(p.running?'🟢 jalan':'⚪ mati')+'</td><td>'+esc(p.email||'-')+'</td>'
+          +'<td><span class="badge v-'+esc(p.verdict)+'">'+esc(p.verdict||'-')+'</span></td>'
+          +'<td>'+p.cookie_count+'</td><td class="muted">'+esc(p.expires||'-')+'</td>'
+          +'<td><button onclick="pmOpen(\''+p.slug+'\',false)">▶️ Buka</button> '
+          +'<button class="alt" onclick="pmOpen(\''+p.slug+'\',true)">🕶️ Headless</button> '
+          +'<button class="alt" onclick="pmKill(\''+p.slug+'\')">⏹️</button> '
+          +'<button class="alt" onclick="pmDel(\''+p.slug+'\')">🗑️</button></td></tr>';
+      });
+      h+='</table></div>';
+    } else {
+      h+='<div class="card muted">Belum ada akun. Klik "📥 Import dari hasil scan" dulu (harus sudah scan bulk).</div>';
+    }
+    document.getElementById('pm_list').innerHTML=h;
+  }catch(e){document.getElementById('pm_list').innerHTML='<div class="card bad">Gagal: '+esc(e.message)+'</div>';}
+}
+function pmMsg(t){document.getElementById('pm_msg').textContent=t;}
+async function pmImport(){
+  pmMsg('⏳ Import akun dari hasil scan terakhir...');
+  try{
+    const r=await fetch('/api/profiles/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({only:['VALID','PARTIAL']})});
+    const d=await r.json();
+    pmMsg(d.ok?('✅ '+d.created+' akun dibuat/diupdate'):('❌ '+(d.error||'')));
+    pmLoad();
+  }catch(e){pmMsg('❌ '+e.message);}
+}
+async function pmLaunchAll(v){
+  pmMsg('⏳ Buka semua akun ('+v+')... ini bisa makan waktu');
+  try{
+    const r=await fetch('/api/profiles/launch_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({verdicts:[v],headless:false,max_launch:8})});
+    const d=await r.json();pmMsg('✅ '+d.launched+' akun dibuka');pmLoad();
+  }catch(e){pmMsg('❌ '+e.message);}
+}
+async function pmOpen(slug,hl){
+  pmMsg('⏳ Buka '+slug+'...');
+  try{
+    const r=await fetch('/api/profiles/'+slug+'/launch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({headless:!!hl})});
+    const d=await r.json();
+    pmMsg(d.ok?('✅ '+(d.email||slug)+' terbuka '+(d.already?'(sudah jalan)':'')+' · CDP '+d.cdp_port):('❌ '+(d.error||JSON.stringify(d))));
+    pmLoad();
+  }catch(e){pmMsg('❌ '+e.message);}
+}
+async function pmKill(slug){
+  try{await fetch('/api/profiles/'+slug+'/kill',{method:'POST'});pmLoad();}catch(e){}
+}
+async function pmDel(slug){
+  if(!confirm('Hapus profil '+slug+' beserta cookienya?'))return;
+  try{await fetch('/api/profiles/'+slug,{method:'DELETE'});pmMsg('🗑️ '+slug+' dihapus');pmLoad();}catch(e){}
+}
 
 // ---- brave ----
 async function braveStatus(){
