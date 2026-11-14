@@ -171,3 +171,29 @@ systemctl --user enable --now chatgpt-cookie-validator.service
 systemctl --user status chatgpt-cookie-validator.service
 ```
 
+
+## 📦 Bulk Auto-Detector Massal (ZIP / Multi-file)
+
+Upload **1 file ZIP** (isi banyak `.txt`/`.json`/`.csv`/`.log`) atau banyak file sekaligus. Setiap file auto-detect format, auto-split jadi target, verifikasi paralel, output **terstruktur**.
+
+Tab **📦 Bulk ZIP**:
+- Drop ZIP atau pilih banyak file
+- Atau paste massal (auto-split)
+- Ringkasan: total target / alive / revoked / partial
+- Tabel per-target: label, verdict, user_email, token_len
+- Export: **JSON / CSV / XLSX**
+
+### Endpoint
+```
+POST /api/bulk/zip?concurrency=6      # multipart file=@cookies.zip
+POST /api/bulk/files?concurrency=6    # multipart files=@a.txt -F files=@b.json
+POST /api/bulk/paste                  # JSON {"raw": "<paste massal>"}
+GET  /api/bulk/export?fmt=csv|xlsx|json
+```
+
+### Contoh CLI
+```bash
+# ZIP -> tabel CSV
+curl -s http://127.0.0.1:8787/api/bulk/zip?concurrency=8 -F 'file=@cookies.zip' > out.json
+curl -s 'http://127.0.0.1:8787/api/bulk/export?fmt=xlsx' -o hasil.xlsx
+```

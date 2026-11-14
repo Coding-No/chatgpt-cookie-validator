@@ -16,9 +16,10 @@ from __future__ import annotations
 import base64, json, time, uuid, hashlib, os, csv, io, threading, subprocess, shutil, re
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from auto_parse import auto_parse, sniff_format
+import bulk as BULK
 from pydantic import BaseModel
 import requests
 
@@ -30,6 +31,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 TIMEOUT = 25
 WORKDIR = Path(__file__).resolve().parent
 BATCH_STORE = WORKDIR / "batch_last.json"      # hasil batch terakhir
+BULK_STORE = WORKDIR / "bulk_last.json"        # hasil bulk (ZIP/multi-file) terakhir
 BRAVE_PROFILE = Path("/tmp/brave-rt-profile")   # profil ISOLASI (tidak sentuh profil user)
 CDP_PORT = int(os.environ.get("BRAVE_CDP_PORT", "9333"))
 
@@ -522,6 +524,166 @@ def api_batch_export(fmt: str = Query("csv")):
                     headers={"Content-Disposition": "attachment; filename=batch_results.csv"})
 
 
+# -------- bulk (ZIP / multi-file / paste massal) --------
+def _bulk_items_to_results(items: list[dict], concurrency: int = 6) -> dict:
+    """items: [{label, raw, cookies, format, source}] -> verified results + summary."""
+    per_file = []
+    all_results = []
+    lock = threading.Lock()
+    conc = max(1, min(int(concurrency or 6), 16))
+    q = list(items)
+    idx = {"i": 0}
+
+    def run():
+        while True:
+            with lock:
+                if idx["i"] >= len(q):
+                    return
+                it = q[idx["i"]]
+                idx["i"] += 1
+            res = verify_one(it.get("label") or "item", it.get("raw") or "",
+                             it.get("cookies"), it.get("format"))
+            # pecah: tiap file bisa >1 target (bulk multi-target dalam 1 file)
+            tgts = it.get("_targets")
+            with lock:
+                if tgts and len(tgts) > 1:
+                    for t in tgts:
+                        r2 = dict(res)
+                        r2["target"] = t.get("label")
+                        all_results.append(r2)
+                    per_file.append({"source": it.get("source"), "file": it.get("label"),
+                                     "targets": len(tgts), "verdict": res["verdict"],
+                                     "cookies": res.get("cookie_count", 0),
+                                     "user_email": res.get("user_email")})
+                else:
+                    all_results.append(res)
+                    per_file.append({"source": it.get("source"), "file": it.get("label"),
+                                     "targets": 1, "verdict": res["verdict"],
+                                     "cookies": res.get("cookie_count", 0),
+                                     "user_email": res.get("user_email")})
+
+    threads = []
+    for _ in range(conc):
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=900)
+
+    summary = {}
+    for r in all_results:
+        summary[r["verdict"]] = summary.get(r["verdict"], 0) + 1
+    return {"summary": summary, "per_file": per_file, "results": all_results}
+
+
+def _finish_bulk(payload: dict) -> JSONResponse:
+    data = {"ts": int(time.time()), **payload}
+    BULK_STORE.write_text(json.dumps(data, indent=2))
+    return JSONResponse({"ok": True, **data})
+
+
+@app.post("/api/bulk/zip")
+async def api_bulk_zip(file: UploadFile = File(...), concurrency: int = 6):
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "File kosong.")
+    try:
+        entries = BULK.extract_from_zip(raw)
+    except Exception as e:
+        raise HTTPException(400, f"ZIP tidak valid: {e}")
+    items = BULK.build_batches(entries)
+    if not items:
+        raise HTTPException(400, "ZIP kosong / tidak ada file cookie ter-parse.")
+    out = _bulk_items_to_results(items, concurrency)
+    out["files_total"] = len(entries)
+    return _finish_bulk(out)
+
+
+@app.post("/api/bulk/files")
+async def api_bulk_files(files: list[UploadFile] = File(...), concurrency: int = 6):
+    entries = []
+    for f in files:
+        content = await f.read()
+        try:
+            text = BULK._decode_bytes(content)
+        except Exception:
+            continue
+        if not text.strip():
+            continue
+        base = os.path.basename(f.filename or "file")
+        label = os.path.splitext(base)[0] or base
+        entries.append({"name": label, "raw": text, "size": len(text),
+                        "source": f.filename or base,
+                        "maybe_cookie": BULK._is_probably_cookie(text)})
+    items = BULK.build_batches(entries)
+    if not items:
+        raise HTTPException(400, "Tidak ada file cookie ter-parse.")
+    out = _bulk_items_to_results(items, concurrency)
+    out["files_total"] = len(entries)
+    return _finish_bulk(out)
+
+
+@app.post("/api/bulk/paste")
+def api_bulk_paste(body: CookieIn, concurrency: int = 6):
+    raw = body.raw or ""
+    if not raw.strip():
+        raise HTTPException(400, "Paste kosong.")
+    # paste massal = 1 "file" yang auto_parse bisa pecah jadi banyak target
+    entries = [{"name": "paste", "raw": raw, "size": len(raw),
+                "source": "paste", "maybe_cookie": True}]
+    items = BULK.build_batches(entries)
+    if not items:
+        raise HTTPException(400, "Paste kosong / gagal parse.")
+    out = _bulk_items_to_results(items, concurrency)
+    out["files_total"] = 1
+    return _finish_bulk(out)
+
+
+@app.get("/api/bulk/export")
+def api_bulk_export(fmt: str = Query("csv")):
+    if not BULK_STORE.exists():
+        raise HTTPException(404, "Belum ada hasil bulk.")
+    data = json.loads(BULK_STORE.read_text())
+    cols = ["label", "target", "verdict", "user_email", "user_name", "user_id", "expires",
+            "token_len", "cookie_alive", "cookie_expired", "cookie_count",
+            "backend_codes", "device_id", "verdict_reason"]
+    if fmt == "json":
+        return Response(json.dumps(data, indent=2), media_type="application/json",
+                        headers={"Content-Disposition": "attachment; filename=bulk_results.json"})
+    if fmt == "xlsx":
+        try:
+            import openpyxl
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "results"
+            ws.append(cols)
+            for r in data.get("results", []):
+                ws.append([r.get(c) for c in cols])
+            ws2 = wb.create_sheet("per_file")
+            ws2.append(["source", "file", "targets", "verdict", "cookies", "user_email"])
+            for r in data.get("per_file", []):
+                ws2.append([r.get(k) for k in ("source", "file", "targets", "verdict", "cookies", "user_email")])
+            ws3 = wb.create_sheet("summary")
+            ws3.append(["verdict", "count"])
+            for k, v in data.get("summary", {}).items():
+                ws3.append([k, v])
+            buf = io.BytesIO()
+            wb.save(buf)
+            buf.seek(0)
+            return Response(buf.getvalue(),
+                            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            headers={"Content-Disposition": "attachment; filename=bulk_results.xlsx"})
+        except Exception as e:
+            raise HTTPException(500, f"xlsx gagal: {e}")
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+    w.writeheader()
+    for r in data.get("results", []):
+        w.writerow(r)
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=bulk_results.csv"})
+
+
 # -------- brave --------
 @app.get("/api/brave/status")
 def api_brave_status():
@@ -602,6 +764,7 @@ input[type=number]{background:#010409;color:#c9d1d9;border:1px solid #30363d;bor
 <div class="tabs">
   <div class="tab active" data-t="single">🔍 Cek Tunggal</div>
   <div class="tab" data-t="batch">📚 Batch</div>
+  <div class="tab" data-t="bulk">📦 Bulk ZIP</div>
   <div class="tab" data-t="brave">🚀 Auto-Login Brave</div>
 </div>
 
@@ -648,6 +811,33 @@ akun-3: oai-did=...; oai-hlib=true; __Secure-next-auth.session-token.0=...
   <button class="alt" onclick="downloadBatch('json')">⬇️ JSON</button>
 </div>
 <div id="outb"></div>
+</div>
+
+<!-- ===== BULK ZIP ===== -->
+<div class="panel" id="p-bulk">
+<div class="card">
+  <b>📦 Upload ZIP / Banyak File — Auto-Detector Massal</b>
+  <div class="muted" style="margin:8px 0">
+    Upload <b>1 ZIP</b> (isi banyak .txt/.json/.csv/.log/dll) <b>atau pilih banyak file sekaligus</b> <b>atau paste massal</b>.
+    Tiap file di-parse otomatis (format bebas, nggak harus sama) → cek semua paralel → output terstruktur (tabel + ringkasan + export).
+  </div>
+  <div class="row">
+    <button class="alt" onclick="document.getElementById('zipf').click()">📦 Pilih ZIP</button>
+    <input type="file" id="zipf" accept=".zip" style="display:none" onchange="bulkZip(this.files[0])">
+    <button class="alt" onclick="document.getElementById('multif').click()">🗂️ Pilih Banyak File</button>
+    <input type="file" id="multif" multiple style="display:none" onchange="bulkFiles(this.files)">
+    <label class="muted">Concurrency <input type="number" id="concb" value="6" min="1" max="16"></label>
+  </div>
+  <div class="muted" style="margin-top:6px">— atau paste massal di sini —</div>
+  <textarea id="rawk" style="height:150px" placeholder="Paste banyak cookie sekaligus (auto-detect + auto-split)..."></textarea>
+  <div class="row">
+    <button onclick="bulkPaste()">📤 Proses Paste Massal</button>
+    <button class="alt" onclick="downloadBulk('csv')" id="bulkdl1" disabled>⬇️ CSV</button>
+    <button class="alt" onclick="downloadBulk('json')" id="bulkdl2" disabled>⬇️ JSON</button>
+    <button class="alt" onclick="downloadBulk('xlsx')" id="bulkdl3" disabled>⬇️ XLSX</button>
+  </div>
+</div>
+<div id="outk"></div>
 </div>
 
 <!-- ===== BRAVE ===== -->
@@ -757,6 +947,68 @@ async function runBatch(){
   }catch(e){out.innerHTML='<div class="card bad">Gagal: '+esc(e.message)+'</div>';}
 }
 function downloadBatch(fmt){window.location='/api/batch/export?fmt='+fmt;}
+
+// ---- bulk (ZIP / multi-file / paste massal) ----
+function bulkSpin(msg){document.getElementById('outk').innerHTML='<div class="card">⏳ '+esc(msg)+'</div>';}
+async function bulkZip(f){
+  if(!f){return;}
+  const out=document.getElementById('outk');
+  bulkSpin('Upload + proses ZIP: '+f.name+' ('+Math.round(f.size/1024)+' KB)...');
+  const fd=new FormData(); fd.append('file',f);
+  const conc=parseInt(document.getElementById('concb').value||'6');
+  try{
+    const r=await fetch('/api/bulk/zip?concurrency='+conc,{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok){out.innerHTML='<div class="card bad">Error: '+esc(d.detail||JSON.stringify(d))+'</div>';return;}
+    renderBulk(d);
+  }catch(e){out.innerHTML='<div class="card bad">Gagal: '+esc(e.message)+'</div>';}
+}
+async function bulkFiles(fl){
+  if(!fl||!fl.length){return;}
+  const out=document.getElementById('outk');
+  bulkSpin('Upload + proses '+fl.length+' file...');
+  const fd=new FormData();
+  for(const f of fl) fd.append('files',f);
+  const conc=parseInt(document.getElementById('concb').value||'6');
+  try{
+    const r=await fetch('/api/bulk/files?concurrency='+conc,{method:'POST',body:fd});
+    const d=await r.json();
+    if(!r.ok){out.innerHTML='<div class="card bad">Error: '+esc(d.detail||JSON.stringify(d))+'</div>';return;}
+    renderBulk(d);
+  }catch(e){out.innerHTML='<div class="card bad">Gagal: '+esc(e.message)+'</div>';}
+}
+async function bulkPaste(){
+  const raw=document.getElementById('rawk').value.trim();
+  if(!raw){alert('Paste dulu');return;}
+  const out=document.getElementById('outk');
+  bulkSpin('Proses paste massal...');
+  const conc=parseInt(document.getElementById('concb').value||'6');
+  try{
+    const r=await fetch('/api/bulk/paste?concurrency='+conc,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw})});
+    const d=await r.json();
+    if(!r.ok){out.innerHTML='<div class="card bad">Error: '+esc(d.detail||JSON.stringify(d))+'</div>';return;}
+    renderBulk(d);
+  }catch(e){out.innerHTML='<div class="card bad">Gagal: '+esc(e.message)+'</div>';}
+}
+function renderBulk(d){
+  const s=d.summary||{};
+  let h='<div class="card"><b>📊 Ringkasan:</b> '+Object.entries(s).map(([k,v])=>`<span class="badge v-${esc(k)}">${esc(k)}: ${v}</span>`).join(' ')+
+        ` &nbsp; <span class="muted">${d.files_total||0} file/sumber · ${d.results.length} target dievaluasi</span></div>`;
+  // tabel per-file
+  h+='<div class="card"><b>🗂️ Per File (sumber)</b><table><tr><th>File</th><th>Sumber</th><th>Target</th><th>Verdict</th><th>Cookie</th><th>Email</th></tr>';
+  (d.per_file||[]).forEach(p=>{h+=`<tr><td>${esc(p.file)}</td><td class="muted">${esc(p.source)}</td><td>${p.targets}</td>
+    <td><span class="badge v-${esc(p.verdict)}">${esc(p.verdict)}</span></td><td>${p.cookies}</td><td>${esc(p.user_email)||'-'}</td></tr>`;});
+  h+='</table></div>';
+  // tabel detail target
+  h+='<div class="card"><b>📋 Detail Target</b><table><tr><th>Label</th><th>Target</th><th>Verdict</th><th>Email</th><th>Token</th><th>Alive/Exp</th><th>Backend</th></tr>';
+  (d.results||[]).forEach(r=>{h+=`<tr><td>${esc(r.label)}</td><td class="muted">${esc(r.target)||'-'}</td>
+    <td><span class="badge v-${esc(r.verdict)}">${esc(r.verdict)}</span></td><td>${esc(r.user_email)||'-'}</td>
+    <td>${r.token_len||0}</td><td>${r.cookie_alive||0}/${r.cookie_expired||0}</td><td class="muted">${esc(r.backend_codes)}</td></tr>`;});
+  h+='</table></div>';
+  document.getElementById('outk').innerHTML=h;
+  ['bulkdl1','bulkdl2','bulkdl3'].forEach(id=>document.getElementById(id).disabled=false);
+}
+function downloadBulk(fmt){window.location='/api/bulk/export?fmt='+fmt;}
 
 // ---- brave ----
 async function braveStatus(){

@@ -1,0 +1,62 @@
+{
+  "ts": 1794660167,
+  "summary": {
+    "PARTIAL": 1,
+    "REVOKED": 1
+  },
+  "per_file": [
+    {
+      "source": "paste",
+      "file": "paste/2",
+      "targets": 1,
+      "verdict": "PARTIAL",
+      "cookies": 3,
+      "user_email": null
+    },
+    {
+      "source": "paste",
+      "file": "paste/1",
+      "targets": 1,
+      "verdict": "REVOKED",
+      "cookies": 18,
+      "user_email": "chhimpamukesh35@gmail.com"
+    }
+  ],
+  "results": [
+    {
+      "label": "paste/2",
+      "ok": true,
+      "verdict": "PARTIAL",
+      "format": "header",
+      "verdict_reason": "session ada tapi tanpa accessToken",
+      "user_email": null,
+      "user_name": null,
+      "user_id": null,
+      "expires": null,
+      "token_len": 0,
+      "cookie_alive": 0,
+      "cookie_expired": 0,
+      "cookie_count": 3,
+      "backend_codes": "",
+      "device_id": "dummy-p"
+    },
+    {
+      "label": "paste/1",
+      "ok": true,
+      "verdict": "REVOKED",
+      "format": "netscape",
+      "verdict_reason": "session cookie masih ada (profil stale terembalikan) TAPI access token sudah di-revoke server-side",
+      "user_email": "chhimpamukesh35@gmail.com",
+      "user_name": "Mukesh Chhimpa",
+      "user_id": "user-4RJ8SvTsuGwEfBRecO9KgKK0",
+      "expires": "2027-02-12T12:42:47.200Z",
+      "token_len": 2161,
+      "cookie_alive": 0,
+      "cookie_expired": 0,
+      "cookie_count": 18,
+      "backend_codes": "me=401:token_revoked;models=401:token_revoked;accounts_check=401:token_revoked;conversations=401:token_revoked",
+      "device_id": "7100c66c-8127-4c39-8aea-15a9823d9e0c"
+    }
+  ],
+  "files_total": 1
+}
