@@ -21,3 +21,7 @@ payload*.json
 # os
 .DS_Store
 Thumbs.db
+
+# state runtime (jangan commit)
+bulk_last.json
+brave-rt-profile/
