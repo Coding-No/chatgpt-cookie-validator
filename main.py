@@ -848,7 +848,12 @@ def api_bulk_alive_zip(only: str = Query("VALID,PARTIAL")):
                 inc = "TRUE" if dom.startswith(".") else "FALSE"
                 sec = "TRUE" if c.get("secure") else "FALSE"
                 raw_exp = c.get("expiry_epoch") or c.get("expires") or sess_exp or 0
-                exp = int(raw_exp) if str(raw_exp).replace(".", "").isdigit() else 0
+                try:
+                    exp = int(float(raw_exp))
+                except Exception:
+                    exp = 0
+                if exp < 100000:  # bukan epoch detik valid → default +30 hari
+                    exp = int(time.time()) + 30 * 86400
                 lines.append("\t".join([dom, inc, c.get("path", "/"), sec, str(exp), c.get("name", ""), c.get("value", "")]))
             z.writestr(stem + ".txt", "\n".join(lines) + "\n")
             # --- JSON array polos: LANGSUNG import ke Cookie-Editor / EditThisCookie ---
@@ -860,6 +865,8 @@ def api_bulk_alive_zip(only: str = Query("VALID,PARTIAL")):
                     exp = float(sess_exp or 0)
                 if exp > 1e12:      # kalau ms → detik
                     exp = exp / 1000.0
+                if exp < 100000:    # fallback +30 hari biar tool gak nolak
+                    exp = float(int(time.time()) + 30 * 86400)
                 return {
                     "domain": c.get("domain", ".chatgpt.com"),
                     "expirationDate": exp,
