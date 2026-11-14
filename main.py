@@ -582,8 +582,86 @@ def _finish_bulk(payload: dict) -> JSONResponse:
     return JSONResponse({"ok": True, **data})
 
 
+# ---------- background job (biar UI gak nyangkut saat ratusan akun) ----------
+BULK_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _run_bulk_job(job_id: str, items: list, files_total: int, concurrency: int):
+    """Jalankan verifikasi bulk di thread terpisah + update progress live."""
+    total_targets = sum(max(1, len(it.get("_targets") or [1])) for it in items)
+    st = BULK_JOBS[job_id]
+    st.update({"status": "running", "done": 0, "total": total_targets,
+               "files_total": files_total, "started": time.time()})
+    per_file, all_results = [], []
+    lock = threading.Lock()
+    q = list(items)
+    idx = {"i": 0}
+    conc = max(1, min(int(concurrency or 6), 32))
+
+    def run():
+        while True:
+            with lock:
+                if idx["i"] >= len(q):
+                    return
+                it = q[idx["i"]]; idx["i"] += 1
+            res = verify_one(it.get("label") or "item", it.get("raw") or "",
+                             it.get("cookies"), it.get("format"))
+            tgts = it.get("_targets")
+            with lock:
+                if tgts and len(tgts) > 1:
+                    for t in tgts:
+                        r2 = dict(res); r2["target"] = t.get("label")
+                        all_results.append(r2)
+                        st["done"] += 1
+                    per_file.append({"source": it.get("source"), "file": it.get("label"),
+                                     "targets": len(tgts), "verdict": res["verdict"],
+                                     "cookies": res.get("cookie_count", 0),
+                                     "user_email": res.get("user_email")})
+                else:
+                    all_results.append(res)
+                    st["done"] += 1
+                    per_file.append({"source": it.get("source"), "file": it.get("label"),
+                                     "targets": 1, "verdict": res["verdict"],
+                                     "cookies": res.get("cookie_count", 0),
+                                     "user_email": res.get("user_email")})
+                # snapshot live ke job store
+                st["last"] = {"label": res.get("label"), "verdict": res.get("verdict"),
+                              "email": res.get("user_email")}
+                st["per_file"] = list(per_file)
+                st["results"] = list(all_results)
+
+    threads = []
+    for _ in range(conc):
+        t = threading.Thread(target=run, daemon=True); t.start(); threads.append(t)
+    for t in threads:
+        t.join(timeout=3600)
+
+    summary = {}
+    for r in all_results:
+        summary[r["verdict"]] = summary.get(r["verdict"], 0) + 1
+    out = {"summary": summary, "per_file": per_file, "results": all_results,
+           "files_total": files_total}
+    _finish_bulk(out)
+    st.update({"status": "done", "summary": summary, "per_file": per_file,
+               "results": all_results, "files_total": files_total,
+               "elapsed": round(time.time() - st["started"], 1)})
+
+
+def _start_job(items: list, files_total: int, concurrency: int) -> str:
+    import uuid
+    job_id = uuid.uuid4().hex[:12]
+    with _JOBS_LOCK:
+        BULK_JOBS[job_id] = {"status": "queued", "done": 0, "total": 0,
+                             "created": time.time()}
+    threading.Thread(target=_run_bulk_job,
+                     args=(job_id, items, files_total, concurrency), daemon=True).start()
+    return job_id
+
+
 @app.post("/api/bulk/zip")
-async def api_bulk_zip(file: UploadFile = File(...), concurrency: int = 6):
+async def api_bulk_zip(file: UploadFile = File(...), concurrency: int = 6,
+                       background: int = Query(1)):
     raw = await file.read()
     if not raw:
         raise HTTPException(400, "File kosong.")
@@ -594,9 +672,29 @@ async def api_bulk_zip(file: UploadFile = File(...), concurrency: int = 6):
     items = BULK.build_batches(entries)
     if not items:
         raise HTTPException(400, "ZIP kosong / tidak ada file cookie ter-parse.")
+    if background:
+        jid = _start_job(items, len(entries), concurrency)
+        return JSONResponse({"ok": True, "job_id": jid, "files_total": len(entries),
+                             "targets": sum(max(1, len(it.get('_targets') or [1])) for it in items)})
     out = _bulk_items_to_results(items, concurrency)
     out["files_total"] = len(entries)
     return _finish_bulk(out)
+
+
+@app.get("/api/bulk/progress/{job_id}")
+def api_bulk_progress(job_id: str):
+    st = BULK_JOBS.get(job_id)
+    if not st:
+        raise HTTPException(404, "Job tidak ditemukan.")
+    payload = {"ok": True, "job_id": job_id, "status": st.get("status"),
+               "done": st.get("done", 0), "total": st.get("total", 0),
+               "files_total": st.get("files_total", 0),
+               "last": st.get("last"), "elapsed": st.get("elapsed")}
+    if st.get("status") == "done":
+        payload.update({"summary": st.get("summary", {}),
+                        "per_file": st.get("per_file", []),
+                        "results": st.get("results", [])})
+    return JSONResponse(payload)
 
 
 @app.post("/api/bulk/files")
@@ -758,7 +856,9 @@ a{color:#58a6ff} .muted{color:#8b949e;font-size:12px}
 input[type=number]{background:#010409;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px;width:80px}
 </style></head>
 <body><div class="wrap">
-<h1>🍪 ChatGPT Cookie Validator <span class="muted">v2</span></h1>
+<h1>🍪 ChatGPT Cookie Validator <span class="muted">v2.1</span></h1>
+<div class="muted" style="margin-top:4px">Bulk auto-detector · upload ZIP / banyak file · progress realtime · export CSV/JSON/XLSX</div>
+<p class="muted" style="margin-top:0">Powered by Parzival</p><div class="muted" style="margin-bottom:10px"><b>Server</b> (Tailscale): <code>http://100.95.162.3:8787</code></div>
 <div class="sub">Cek cookie valid/expired · generate URL login · batch · auto-login Brave</div>
 
 <div class="tabs">
@@ -950,17 +1050,45 @@ function downloadBatch(fmt){window.location='/api/batch/export?fmt='+fmt;}
 
 // ---- bulk (ZIP / multi-file / paste massal) ----
 function bulkSpin(msg){document.getElementById('outk').innerHTML='<div class="card">⏳ '+esc(msg)+'</div>';}
+let _bulkTimer=null;
+function bulkProgress(d){
+  const pct = d.total? Math.round(100*d.done/d.total) : 0;
+  let h=`<div class="card"><b>⏳ Memproses… ${d.done}/${d.total}</b> (${d.files_total} file/sumber)
+    <div style="background:#21262d;border-radius:6px;height:18px;margin:10px 0;overflow:hidden">
+      <div style="background:#238636;height:100%;width:${pct}%;transition:width .3s"></div></div>
+    <div class="muted">${pct}% · ${d.elapsed||0}s`;
+  if(d.last){h+=` · terakhir: <b>${esc(d.last.label)}</b> → <span class="badge v-${esc(d.last.verdict)}">${esc(d.last.verdict)}</span> ${esc(d.last.email||'')}`;}
+  h+='</div>';
+  document.getElementById('outk').innerHTML=h;
+}
+async function _pollJob(jid){
+  try{
+    const r=await fetch('/api/bulk/progress/'+jid);
+    const d=await r.json();
+    if(d.status==='done'){
+      if(_bulkTimer){clearInterval(_bulkTimer);_bulkTimer=null;}
+      renderBulk(d); return;
+    }
+    bulkProgress(d);
+  }catch(e){/* keep polling */}
+}
+function _startPoll(jid){
+  if(_bulkTimer)clearInterval(_bulkTimer);
+  _bulkTimer=setInterval(()=>_pollJob(jid),1200);
+  _pollJob(jid);
+}
 async function bulkZip(f){
   if(!f){return;}
   const out=document.getElementById('outk');
-  bulkSpin('Upload + proses ZIP: '+f.name+' ('+Math.round(f.size/1024)+' KB)...');
+  bulkSpin('Upload ZIP: '+f.name+' ('+Math.round(f.size/1024)+' KB)...');
   const fd=new FormData(); fd.append('file',f);
   const conc=parseInt(document.getElementById('concb').value||'6');
   try{
-    const r=await fetch('/api/bulk/zip?concurrency='+conc,{method:'POST',body:fd});
+    const r=await fetch('/api/bulk/zip?concurrency='+conc+'&background=1',{method:'POST',body:fd});
     const d=await r.json();
     if(!r.ok){out.innerHTML='<div class="card bad">Error: '+esc(d.detail||JSON.stringify(d))+'</div>';return;}
-    renderBulk(d);
+    if(d.job_id){bulkProgress({done:0,total:d.targets,files_total:d.files_total,elapsed:0});_startPoll(d.job_id);}
+    else renderBulk(d);
   }catch(e){out.innerHTML='<div class="card bad">Gagal: '+esc(e.message)+'</div>';}
 }
 async function bulkFiles(fl){
